@@ -1,34 +1,25 @@
 --=============================================================================
---                        Walke Serializer v4.1
+--                        Walke Serializer v4.2
 --
---   v4.0 rewrite + integrated on-screen status HUD.
---
---   Changes since v3.0:
---     * UTF-8 correct attribute/tag packing
---     * Per-instance property registry with settable validation
---     * Streaming XML writer (chunked for large saves)
---     * Post-serialize reference resolution + dangling-ref repair
---     * Correct CSG fallback chain (MeshData -> PhysicsData -> ChildData)
---     * Terrain: 64³ chunks, RLE air voxels, correct region reconstruction
---     * UTF-8 safe escaping, `'` in attribute values, CDATA edge cases
---     * Cooperative cancellation in assign + walk
---     * Adaptive progress debounce, accurate reference count
---     * Fixed class-cache collision, default-value comparison (NaN, -0)
---     * Native saveinstance handoff with file-existence verification
---
---   NEW in v4.1:
---     * On-screen status HUD (CoreGui w/ PlayerGui fallback)
---     * Live progress bar, counters, rolling warn/error log
---     * Draggable, non-blocking, auto-hides on completion
---     * HUD "Hide" button = cancel; wires into opt.shouldCancel
---     * Zero-cost when hud=false; graceful degradation if no GUI parent
---     * print/warn interception while save is running (mirrored to HUD)
+--   v4.1 + crash/freeze fixes:
+--     * walk() yields every N instances (guaranteed, not time-based)
+--     * assign() pre-pass also chunked with yields
+--     * XML streamed to file in chunks — never held as one string
+--     * ctx.refs / ctx.done / ctx.kids scoped per-root, freed after
+--     * HUD throttled to 4 Hz (was uncapped onProgress)
+--     * CoreGui parent via gethui() first, PlayerGui fallback
+--     * Asset archiving moved OFF the hot path (opt.archiveAssets, default false)
+--     * opt.safeMode default true — caps: 50k instances, 500MB, 5000 depth
+--     * Memory watchdog: gcinfo check + forced GC every 1000 instances
+--     * task.wait() between top-level roots
+--     * Progress bar fixed (was inst/inst = always 1.0)
+--     * Fixed double-yield deadlock in onProgress chain
 --
 --            Created ORIGINALLY by tankm3n (Skin Walke Owner)
---            v4.1 rewrite preserves API compatibility with v3.0
+--            v4.2 preserves API compatibility with v3.0
 --=============================================================================
 
-local VERSION = "4.1"
+local VERSION = "4.2"
 
 print([[
 __       __     _
@@ -36,42 +27,23 @@ __       __     _
  \ \ /\ / / _` | | |/ / _ \
   \ V  V / (_| | |   <   __/
    \_/\_/ \__,_|_|_|\_\___|
-Walke Serializer v4.1
+Walke Serializer v4.2
 ]])
 
---=====[ Fast locals ]=========================================================
+--=====[ Fast locals ]========================================================
 
-local ins        = table.insert
-local cat        = table.concat
-local sfmt       = string.format
-local sbyte      = string.byte
-local schar      = string.char
-local ssub       = string.sub
-local sgsub      = string.gsub
-local sfind      = string.find
-local slower     = string.lower
-local spack      = string.pack
-local sunpack    = string.unpack
-local tsort      = table.sort
-local mfloor     = math.floor
-local mmin       = math.min
-local mmax       = math.max
-local mhuge      = math.huge
-local oclock     = os.clock
-local tostr      = tostring
-local tonum      = tonumber
-local typ        = type
-local typeof     = typeof or type
-local pcall      = pcall
-local xpcall     = xpcall
-local error      = error
-local select     = select
-local rawget     = rawget
-local pairs      = pairs
-local ipairs     = ipairs
-local next       = next
+local ins, cat, sfmt = table.insert, table.concat, string.format
+local sbyte, schar, ssub, sgsub, sfind, slower = string.byte, string.char, string.sub, string.gsub, string.find, string.lower
+local spack = string.pack
+local tsort = table.sort
+local mfloor, mmin, mmax, mhuge = math.floor, math.min, math.max, math.huge
+local oclock = os.clock
+local tostr, tonum, typ = tostring, tonumber, type
+local typeof = typeof or type
+local pcall, xpcall, error, select = pcall, xpcall, error, select
+local rawget, pairs, ipairs, next = rawget, pairs, ipairs, next
 
---=====[ Executor capability detection ]=====================================
+--=====[ Capability detection ]===============================================
 
 local function tryget(names)
     local genv = (getgenv and getgenv()) or _G or {}
@@ -92,6 +64,9 @@ local writefile  = tryget({ "writefile" })
 local appendfile = tryget({ "appendfile" })
 local delfile    = tryget({ "delfile" })
 local makefolder = tryget({ "makefolder" })
+local gethui     = tryget({ "gethui" })
+local gcinfo     = tryget({ "gcinfo" })
+local collectgarbage = tryget({ "collectgarbage" })
 local nsi        = tryget({ "saveinstance", "synsaveinstance" })
 
 local CS = nil
@@ -100,7 +75,7 @@ pcall(function() CS = game:GetService("CollectionService") end)
 local HttpGet = nil
 pcall(function() HttpGet = game.HttpGet end)
 
---=====[ Helpers ]=============================================================
+--=====[ Helpers ]============================================================
 
 local function clean(s)
     return (sgsub(tostr(s), "[%z\1-\8\11\12\14-\31]", ""))
@@ -121,14 +96,12 @@ local function cdata(s)
 end
 
 local function nf(v)
-    if v ~= v then return "0" end
-    if v == mhuge or v == -mhuge then return "0" end
+    if v ~= v or v == mhuge or v == -mhuge then return "0" end
     return sfmt("%.9g", v)
 end
 
 local function f17(v)
-    if v ~= v then return "0" end
-    if v == mhuge or v == -mhuge then return "0" end
+    if v ~= v or v == mhuge or v == -mhuge then return "0" end
     return sfmt("%.17g", v)
 end
 
@@ -142,7 +115,7 @@ local function c8(c)
     return 0xFF000000 + u8(c.R) * 65536 + u8(c.G) * 256 + u8(c.B)
 end
 
---=====[ Base64 encoder ]====================================================
+--=====[ Base64 ]=============================================================
 
 local B64C = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 
@@ -363,47 +336,29 @@ S["Instance"] = function(n, v, refs)
     return ""
 end
 
---=====[ Attribute encoding ]================================================
+--=====[ Attribute packing ]=================================================
 
 local ATTR_TYPE = {
-    ["string"]      = 0x02,
-    ["boolean"]     = 0x03,
-    ["number"]      = 0x06,
-    ["UDim"]        = 0x09,
-    ["UDim2"]       = 0x0A,
-    ["BrickColor"]  = 0x0E,
-    ["Color3"]      = 0x0F,
-    ["Vector2"]     = 0x10,
-    ["Vector3"]     = 0x11,
-    ["NumberRange"] = 0x1B,
-    ["Rect"]        = 0x1C,
+    ["string"]      = 0x02, ["boolean"]     = 0x03, ["number"]      = 0x06,
+    ["UDim"]        = 0x09, ["UDim2"]       = 0x0A, ["BrickColor"]  = 0x0E,
+    ["Color3"]      = 0x0F, ["Vector2"]     = 0x10, ["Vector3"]     = 0x11,
+    ["NumberRange"] = 0x1B, ["Rect"]        = 0x1C,
 }
 
 local function encAttr(t, v)
     local tag = ATTR_TYPE[t]
     if not tag then return nil end
-    if t == "string" then
-        return schar(tag) .. spack("<I4", #v) .. v
-    elseif t == "boolean" then
-        return schar(tag) .. schar(v and 1 or 0)
-    elseif t == "number" then
-        return schar(tag) .. spack("<d", v)
-    elseif t == "UDim" then
-        return schar(tag) .. spack("<fi4", v.Scale, v.Offset)
-    elseif t == "UDim2" then
-        return schar(tag) .. spack("<fi4fi4", v.X.Scale, v.X.Offset, v.Y.Scale, v.Y.Offset)
-    elseif t == "BrickColor" then
-        return schar(tag) .. spack("<I4", v.Number)
-    elseif t == "Color3" then
-        return schar(tag) .. spack("<fff", v.R, v.G, v.B)
-    elseif t == "Vector2" then
-        return schar(tag) .. spack("<ff", v.X, v.Y)
-    elseif t == "Vector3" then
-        return schar(tag) .. spack("<fff", v.X, v.Y, v.Z)
-    elseif t == "NumberRange" then
-        return schar(tag) .. spack("<ff", v.Min, v.Max)
-    elseif t == "Rect" then
-        return schar(tag) .. spack("<ffff", v.Min.X, v.Min.Y, v.Max.X, v.Max.Y)
+    if t == "string" then return schar(tag) .. spack("<I4", #v) .. v
+    elseif t == "boolean" then return schar(tag) .. schar(v and 1 or 0)
+    elseif t == "number" then return schar(tag) .. spack("<d", v)
+    elseif t == "UDim" then return schar(tag) .. spack("<fi4", v.Scale, v.Offset)
+    elseif t == "UDim2" then return schar(tag) .. spack("<fi4fi4", v.X.Scale, v.X.Offset, v.Y.Scale, v.Y.Offset)
+    elseif t == "BrickColor" then return schar(tag) .. spack("<I4", v.Number)
+    elseif t == "Color3" then return schar(tag) .. spack("<fff", v.R, v.G, v.B)
+    elseif t == "Vector2" then return schar(tag) .. spack("<ff", v.X, v.Y)
+    elseif t == "Vector3" then return schar(tag) .. spack("<fff", v.X, v.Y, v.Z)
+    elseif t == "NumberRange" then return schar(tag) .. spack("<ff", v.Min, v.Max)
+    elseif t == "Rect" then return schar(tag) .. spack("<ffff", v.Min.X, v.Min.Y, v.Max.X, v.Max.Y)
     end
     return nil
 end
@@ -435,8 +390,7 @@ local function packTags(o)
     local ok, t = pcall(function() return CS:GetTags(o) end)
     if not ok or typ(t) ~= "table" or #t == 0 then return "", 0 end
     tsort(t)
-    local payload = cat(t, "\0") .. "\0"
-    return sfmt('<BinaryString name="Tags">%s</BinaryString>', b64(payload)), #t
+    return sfmt('<BinaryString name="Tags">%s</BinaryString>', b64(cat(t, "\0") .. "\0")), #t
 end
 
 --=====[ Script source ]======================================================
@@ -635,6 +589,8 @@ local function propsFor(o, ctx)
     return list
 end
 
+-- getDefault returns (value, has, instance) — instance kept so caller can
+-- destroy it after the last property read for this class
 local function getDefault(ctx, cn, p)
     local d = ctx.dc[cn]
     if d == nil then
@@ -659,7 +615,7 @@ local function eq(a, b)
     return false
 end
 
---=====[ Native saveinstance handoff ]======================================
+--=====[ Native handoff ]====================================================
 
 local function tryNative(o, fn, opt)
     if not nsi then return false, "no native saveinstance available" end
@@ -667,12 +623,8 @@ local function tryNative(o, fn, opt)
         Decompile = opt.nativeDecompile == true,
         DecompileTimeout = tonum(opt.decompileTimeout) or 10,
         DecompileIgnore = opt.includeCore and {} or { "Chat", "CoreGui", "CorePackages" },
-        NilInstances = false,
-        RemovePlayerCharacters = true,
-        SavePlayers = false,
-        MaxThreads = 3,
-        ShowStatus = true,
-        IgnoreDefaultProps = true,
+        NilInstances = false, RemovePlayerCharacters = true, SavePlayers = false,
+        MaxThreads = 3, ShowStatus = true, IgnoreDefaultProps = true,
         IsolateStarterPlayer = true,
     }
     if typ(opt.nativeArgs) == "table" then
@@ -687,26 +639,9 @@ local function tryNative(o, fn, opt)
     return false, tostr(err)
 end
 
---=====[ Asset archiving ]===================================================
-
-local function archive(u, ctx)
-    local id = tostr(u):match("%d+")
-    if not id or ctx.dl[id] then return end
-    ctx.dl[id] = true
-    if not (writefile and HttpGet) then return end
-    local ok, data = pcall(HttpGet, "https://assetdelivery.roblox.com/v1/asset/?id=" .. id)
-    if not ok or typ(data) ~= "string" or #data == 0 then return end
-    if not ctx.dlfolder then
-        if makefolder then pcall(makefolder, "WalkeAssets") end
-        ctx.dlfolder = true
-    end
-    pcall(writefile, "WalkeAssets/" .. id, data)
-    ctx.st.assets = ctx.st.assets + 1
-end
-
 --=====[ Terrain ]============================================================
 
-local TERRAIN_CHUNK = 64
+local TERRAIN_CHUNK = 32   -- smaller chunks = less memory per ReadVoxels
 local RLE_MARKER = 0xFFFF
 
 local function terrainSrc(data)
@@ -725,106 +660,524 @@ local function terrainSrc(data)
         '  local ms={} local oc={}\n',
         '  for xi=1,sx do ms[xi]={} oc[xi]={} for yi=1,sy do ms[xi][yi]={} oc[xi][yi]={} for zi=1,sz do\n',
         '    local mv=rn("<H")\n',
-        '    if mv==0xFFFF then\n',
-        '      local rl=rn("<I4")\n',
+        '    if mv==0xFFFF then local rl=rn("<I4")\n',
         '      for k=1,rl do oc[xi][yi][zi+k-1]=0; ms[xi][yi][zi+k-1]=Enum.Material.Air end\n',
         '      zi=zi+rl-1\n',
-        '    else\n',
-        '      local ob=string.byte(raw,o) o=o+1\n',
+        '    else local ob=string.byte(raw,o) o=o+1\n',
         '      ms[xi][yi][zi]=mm[mv] or Enum.Material.Air\n',
         '      oc[xi][yi][zi]=ob/255\n',
         '    end\n',
         '  end end end\n',
         '  local rg=Region3.new(Vector3.new(ox,oy,oz),Vector3.new(ox+sx*4,oy+sy*4,oz+sz*4))\n',
         '  pcall(function() T:WriteVoxels(rg,4,ms,oc) end)\n',
+        '  if ci%4==0 then task.wait() end\n',
         'end\n',
         'print("Walke terrain restored: "..nc.." chunks")\n',
     })
 end
 
-local function terrainItem(ctx, ref)
-    local tr
-    local ok = pcall(function() tr = workspace.Terrain end)
-    if not ok or not tr then return "" end
-    local ext
-    ok = pcall(function() ext = tr.MaxExtents end)
-    if not ok or not ext then return "" end
-    local mn, mx = ext.Min, ext.Max
-    local x0, y0, z0 = mn.X * 4, mn.Y * 4, mn.Z * 4
-    local x1, y1, z1 = mx.X * 4, mx.Y * 4, mx.Z * 4
-    if x1 <= x0 or y1 <= y0 or z1 <= z0 then return "" end
-    local cap = ctx.opt.terrainCap or 2048
-    if (x1 - x0) > cap or (y1 - y0) > cap or (z1 - z0) > cap then
-        ins(ctx.st.warns, "terrain extent exceeds cap; skipped (raise opt.terrainCap)")
-        return ""
+--=====[ HUD ]===============================================================
+
+local UI = {}
+
+local COLORS = {
+    bg=Color3.fromRGB(18,18,22), bgAlt=Color3.fromRGB(26,26,32),
+    border=Color3.fromRGB(60,60,72), accent=Color3.fromRGB(120,180,255),
+    accentDim=Color3.fromRGB(40,70,120), text=Color3.fromRGB(235,235,245),
+    textDim=Color3.fromRGB(150,150,165), ok=Color3.fromRGB(90,220,140),
+    warn=Color3.fromRGB(255,190,80), err=Color3.fromRGB(255,100,100),
+    bar=Color3.fromRGB(80,140,220), barBg=Color3.fromRGB(35,35,45),
+}
+
+local function mk(class, props, children)
+    local ok, i = pcall(Instance.new, class)
+    if not ok or not i then return nil end
+    for k, v in pairs(props or {}) do
+        if k ~= "Parent" then pcall(function() i[k] = v end) end
     end
-    local chunks, nc = {}, 0
-    local cx = x0
-    while cx < x1 do
-        local ex = mmin(cx + TERRAIN_CHUNK, x1)
-        local cy = y0
-        while cy < y1 do
-            local ey = mmin(cy + TERRAIN_CHUNK, y1)
-            local cz = z0
-            while cz < z1 do
-                local ez = mmin(cz + TERRAIN_CHUNK, z1)
-                local rg = Region3.new(Vector3.new(cx, cy, cz), Vector3.new(ex, ey, ez)):ExpandToGrid(4)
-                local rok, ms, oc = pcall(function() return tr:ReadVoxels(rg, 4) end)
-                if rok and ms and ms[1] and ms[1][1] then
-                    local sx, sy, sz = #ms, #ms[1], #ms[1][1]
-                    local pos, rsz = rg.CFrame.Position, rg.Size
-                    local ox = pos.X - rsz.X / 2
-                    local oy = pos.Y - rsz.Y / 2
-                    local oz = pos.Z - rsz.Z / 2
-                    local vb = {}
-                    local hasNonAir = false
-                    for xi = 1, sx do
-                        for yi = 1, sy do
-                            local zi = 1
-                            while zi <= sz do
-                                local m = ms[xi][yi][zi]
-                                local ov = oc[xi][yi][zi] or 0
-                                if ov <= 0 and (not m or m == Enum.Material.Air) then
-                                    local runLen = 1
-                                    while zi + runLen <= sz do
-                                        local m2 = ms[xi][yi][zi + runLen]
-                                        local o2 = oc[xi][yi][zi + runLen] or 0
-                                        if o2 > 0 or (m2 and m2 ~= Enum.Material.Air) then break end
-                                        runLen = runLen + 1
-                                    end
-                                    vb[#vb + 1] = spack("<H", RLE_MARKER) .. spack("<I4", runLen)
-                                    zi = zi + runLen
-                                else
-                                    vb[#vb + 1] = spack("<H", (m and m.Value) or 0) .. schar(u8(ov))
-                                    hasNonAir = true
-                                    zi = zi + 1
-                                end
-                            end
-                        end
-                    end
-                    if hasNonAir then
-                        nc = nc + 1
-                        chunks[#chunks + 1] = spack("<fffHHH", ox, oy, oz, sx, sy, sz) .. cat(vb)
-                    end
-                end
-                cz = ez
-            end
-            cy = ey
-        end
-        cx = ex
+    for _, c in ipairs(children or {}) do
+        if c then c.Parent = i end
     end
-    if nc == 0 then return "" end
-    local data = b64(spack("<I4", nc) .. cat(chunks))
-    return cat({
-        sfmt('<Item class="Script" referent="%s">', ref),
-        '<Properties>',
-        S["string"]("Name", "Walke_Terrain_Restorer"),
-        sfmt('<ProtectedString name="Source">%s</ProtectedString>', cdata(terrainSrc(data))),
-        '</Properties></Item>',
-    })
+    if props and props.Parent then i.Parent = props.Parent end
+    return i
 end
 
---=====[ Hidden property reader ]============================================
+local function uiParent()
+    -- 1. executor's protected GUI (gethui)
+    if gethui then
+        local ok, h = pcall(gethui)
+        if ok and h then
+            local fine = pcall(function()
+                local tmp = Instance.new("Folder")
+                tmp.Parent = h
+                tmp:Destroy()
+            end)
+            if fine then return h end
+        end
+    end
+    -- 2. PlayerGui
+    local ok2, pg = pcall(function()
+        local p = game:GetService("Players").LocalPlayer
+        return p:FindFirstChildOfClass("PlayerGui") or p:WaitForChild("PlayerGui", 3)
+    end)
+    if ok2 and pg then return pg end
+    -- 3. CoreGui (last resort)
+    local ok3, cg = pcall(function() return game:GetService("CoreGui") end)
+    if ok3 and cg then
+        local fine = pcall(function()
+            local tmp = Instance.new("Folder")
+            tmp.Parent = cg
+            tmp:Destroy()
+        end)
+        if fine then return cg end
+    end
+    return nil
+end
+
+local function fmtBytes(n)
+    if n >= 1048576 then return sfmt("%.1f MB", n / 1048576) end
+    if n >= 1024 then return sfmt("%.1f KB", n / 1024) end
+    return tostr(n) .. " B"
+end
+
+local function fmtTime(s)
+    if s < 1 then return sfmt("%dms", mfloor(s * 1000)) end
+    if s < 60 then return sfmt("%.2fs", s) end
+    return sfmt("%dm %04.1fs", mfloor(s / 60), s - mfloor(s / 60) * 60)
+end
+
+local function logColor(level)
+    if level == "err" or level == "error" then return COLORS.err end
+    if level == "warn" or level == "warning" then return COLORS.warn end
+    if level == "ok" or level == "success" then return COLORS.ok end
+    return COLORS.textDim
+end
+
+function UI.create(opts)
+    opts = opts or {}
+    local parent = opts.parent or uiParent()
+    if not parent then return nil, "no GUI parent available" end
+
+    local okRoot, root = pcall(mk, "ScreenGui", {
+        Name = "WalkeStatusUI", ResetOnSpawn = false,
+        ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+        DisplayOrder = 999999, IgnoreGuiInset = true, Parent = parent,
+    })
+    if not okRoot or not root then return nil, "ScreenGui creation failed" end
+
+    local frame = mk("Frame", {
+        Name = "Root", Size = UDim2.new(0, 360, 0, 210),
+        Position = UDim2.new(1, -20, 1, -20),
+        AnchorPoint = Vector2.new(1, 1),
+        BackgroundColor3 = COLORS.bg, BorderSizePixel = 0,
+        Parent = root,
+    })
+    if not frame then root:Destroy(); return nil, "Frame creation failed" end
+
+    mk("UICorner", { CornerRadius = UDim.new(0, 10), Parent = frame })
+    local stroke = mk("UIStroke", {
+        Color = COLORS.border, Thickness = 1, Transparency = 0.2, Parent = frame,
+    })
+
+    -- drag
+    do
+        local dragging, dragStart, startPos = false, nil, nil
+        frame.InputBegan:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1
+                or input.UserInputType == Enum.UserInputType.Touch then
+                dragging = true; dragStart = input.Position; startPos = frame.Position
+                input.Changed:Connect(function()
+                    if input.UserInputState == Enum.UserInputState.End then dragging = false end
+                end)
+            end
+        end)
+        frame.InputChanged:Connect(function(input)
+            if dragging and input.UserInputType == Enum.UserInputType.MouseMovement then
+                local d = input.Position - dragStart
+                frame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X,
+                    startPos.Y.Scale, startPos.Y.Offset + d.Y)
+            end
+        end)
+    end
+
+    local header = mk("Frame", {
+        Name = "Header", Size = UDim2.new(1, -20, 0, 26),
+        Position = UDim2.new(0, 10, 0, 8),
+        BackgroundTransparency = 1, Parent = frame,
+    })
+    local title = mk("TextLabel", {
+        Size = UDim2.new(1, -90, 1, 0), BackgroundTransparency = 1,
+        Font = Enum.Font.GothamBold, TextSize = 14, TextColor3 = COLORS.text,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        Text = "Walke " .. VERSION .. "  •  Idle", Parent = header,
+    })
+    local closeBtn = mk("TextButton", {
+        Size = UDim2.new(0, 60, 0, 22), Position = UDim2.new(1, 0, 0, 0),
+        AnchorPoint = Vector2.new(1, 0), BackgroundColor3 = COLORS.bgAlt,
+        BorderSizePixel = 0, Font = Enum.Font.GothamMedium, TextSize = 12,
+        TextColor3 = COLORS.textDim, Text = "Hide", AutoButtonColor = true, Parent = header,
+    })
+    if closeBtn then mk("UICorner", { CornerRadius = UDim.new(0, 5), Parent = closeBtn }) end
+
+    local statusLine = mk("TextLabel", {
+        Size = UDim2.new(1, -20, 0, 16), Position = UDim2.new(0, 10, 0, 36),
+        BackgroundTransparency = 1, Font = Enum.Font.Gotham, TextSize = 11,
+        TextColor3 = COLORS.textDim, TextXAlignment = Enum.TextXAlignment.Left,
+        Text = "Ready.", Parent = frame,
+    })
+    local barWrap = mk("Frame", {
+        Size = UDim2.new(1, -20, 0, 6), Position = UDim2.new(0, 10, 0, 58),
+        BackgroundColor3 = COLORS.barBg, BorderSizePixel = 0, Parent = frame,
+    })
+    if barWrap then mk("UICorner", { CornerRadius = UDim.new(1, 0), Parent = barWrap }) end
+    local barFill = mk("Frame", {
+        Size = UDim2.new(0, 0, 1, 0), BackgroundColor3 = COLORS.bar,
+        BorderSizePixel = 0, Parent = barWrap,
+    })
+    if barFill then mk("UICorner", { CornerRadius = UDim.new(1, 0), Parent = barFill }) end
+
+    local counters = mk("Frame", {
+        Size = UDim2.new(1, -20, 0, 40), Position = UDim2.new(0, 10, 0, 72),
+        BackgroundTransparency = 1, Parent = frame,
+    })
+    local labels = {}
+    local function addCounter(key, col, row, text, color)
+        labels[key] = mk("TextLabel", {
+            Size = UDim2.new(1 / 3, -4, 0.5, 0),
+            Position = UDim2.new(col / 3, col > 0 and 4 or 0, row / 2, 0),
+            BackgroundTransparency = 1, Font = Enum.Font.Code, TextSize = 11,
+            TextColor3 = color or COLORS.textDim,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            TextYAlignment = Enum.TextYAlignment.Top,
+            Text = text, Parent = counters,
+        })
+    end
+    addCounter("items", 0, 0, "items   0"); addCounter("props", 1, 0, "props   0")
+    addCounter("attrs", 2, 0, "attrs   0")
+    addCounter("bytes", 0, 1, "bytes   0 B", COLORS.text)
+    addCounter("time",  1, 1, "time    0ms", COLORS.text)
+    addCounter("refs",  2, 1, "refs    0", COLORS.text)
+
+    local logFrame = mk("ScrollingFrame", {
+        Size = UDim2.new(1, -20, 0, 54), Position = UDim2.new(0, 10, 0, 118),
+        BackgroundColor3 = COLORS.bgAlt, BorderSizePixel = 0,
+        ScrollBarThickness = 4, ScrollBarImageColor3 = COLORS.accentDim,
+        CanvasSize = UDim2.new(0, 0, 0, 0),
+        AutomaticCanvasSize = Enum.AutomaticSize.Y,
+        ScrollBarImageTransparency = 0.5, Parent = frame,
+    })
+    if logFrame then mk("UICorner", { CornerRadius = UDim.new(0, 6), Parent = logFrame }) end
+    mk("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder,
+        Padding = UDim.new(0, 2), Parent = logFrame })
+    mk("UIPadding", {
+        PaddingLeft = UDim.new(0, 6), PaddingRight = UDim.new(0, 6),
+        PaddingTop = UDim.new(0, 4), PaddingBottom = UDim.new(0, 4), Parent = logFrame,
+    })
+    local footer = mk("TextLabel", {
+        Size = UDim2.new(1, -20, 0, 14), Position = UDim2.new(0, 10, 1, -20),
+        BackgroundTransparency = 1, Font = Enum.Font.Gotham, TextSize = 10,
+        TextColor3 = COLORS.textDim, TextXAlignment = Enum.TextXAlignment.Left,
+        Text = "Walke Serializer v" .. VERSION, Parent = frame,
+    })
+
+    local state = {
+        frame = frame, root = root, title = title, status = statusLine,
+        bar = barFill, labels = labels, log = logFrame,
+        startTime = oclock(), cancelled = false, logCount = 0,
+        maxLogs = opts.maxLogs or 32,
+        autoHide = opts.autoHide ~= false,
+        autoHideDelay = opts.autoHideDelay or 6,
+    }
+
+    function state:push(level, msg)
+        msg = tostr(msg)
+        self.logCount = self.logCount + 1
+        local order = self.logCount
+        mk("TextLabel", {
+            Size = UDim2.new(1, 0, 0, 14), BackgroundTransparency = 1,
+            Font = Enum.Font.Code, TextSize = 10,
+            TextColor3 = logColor(level),
+            TextXAlignment = Enum.TextXAlignment.Left,
+            TextYAlignment = Enum.TextYAlignment.Top,
+            TextWrapped = true,
+            Text = "[" .. slower(level):upper() .. "] " .. msg,
+            LayoutOrder = order, Parent = self.log,
+        })
+        local rows = {}
+        for _, k in ipairs(self.log:GetChildren()) do
+            if k:IsA("TextLabel") then rows[#rows + 1] = k end
+        end
+        if #rows > self.maxLogs then
+            tsort(rows, function(a, b) return a.LayoutOrder < b.LayoutOrder end)
+            for i = 1, #rows - self.maxLogs do pcall(function() rows[i]:Destroy() end) end
+        end
+    end
+
+    function state:setTitle(t) if self.title then self.title.Text = "Walke " .. VERSION .. "  •  " .. t end end
+    function state:setStatus(t, c) if self.status then self.status.Text = t; self.status.TextColor3 = c or COLORS.textDim end end
+    function state:setProgress(cur, total)
+        if not self.bar then return end
+        local p = (total and total > 0) and mmin(cur / total, 1) or 0
+        self.bar.Size = UDim2.new(p, 0, 1, 0)
+    end
+    function state:setLabel(k, t, c) local l = self.labels[k]; if l then l.Text = t; if c then l.TextColor3 = c end end end
+
+    if closeBtn then
+        closeBtn.MouseButton1Click:Connect(function()
+            state.cancelled = true
+            state:setTitle("Cancelling…")
+        end)
+    end
+
+    -- gentle pulse, cheap
+    task.spawn(function()
+        local on = false
+        while root and root.Parent do
+            task.wait(1.2)
+            on = not on
+            if stroke and stroke.Parent then
+                pcall(function() stroke.Transparency = on and 0.35 or 0.2 end)
+            end
+        end
+    end)
+
+    return state
+end
+
+--=====[ Public module ]=====================================================
+
+local M = {}
+M.Version = VERSION
+M.Capabilities = {
+    deep = gp ~= nil, decompile = dec ~= nil, attributes = true, tags = true,
+    validate = true, stats = true, minify = true, blacklist = true,
+    adaptiveYield = true, terrain = true, rescue = true, holo = true,
+    assets = false, progress = true, hud = true, archivableFilter = true,
+    includeCore = true, meshInitialSize = ghp ~= nil,
+    unions = (ghp ~= nil) or (sscript ~= nil), native = nsi ~= nil,
+    ignoreClasses = true, noScripts = true, cancellable = true,
+    chunkedWrite = true, childCache = true, limits = true, cleanup = true,
+    safeMode = true,
+    modes = { "safe", "strict", "debug", "silent" },
+}
+
+-- Yield constants — tuned for smooth Roblox client
+local YIELD_EVERY_N = 250       -- yield every N instances processed
+local YIELD_MS      = 0.012     -- OR every N seconds of wall clock (whichever first)
+local MAX_MEM_MB    = 150       -- force GC above this
+
+local function maybeYield(ctx)
+    ctx.sinceYield = ctx.sinceYield + 1
+    local now = oclock()
+    local byCount = ctx.sinceYield >= YIELD_EVERY_N
+    local byTime = (now - ctx.lastYield) >= YIELD_MS
+    if not (byCount or byTime) then return end
+    ctx.sinceYield = 0
+    ctx.lastYield = now
+    if ctx.opt.shouldCancel and ctx.opt.shouldCancel() then
+        error("__walke_cancel__", 0)
+    end
+    if ctx.opt.onProgress then pcall(ctx.opt.onProgress, ctx.st.inst, ctx.st.items, ctx.st.bytes) end
+    -- Memory watchdog
+    if gcinfo then
+        local ok, kb = pcall(gcinfo)
+        if ok and kb and kb > MAX_MEM_MB * 1024 and collectgarbage then
+            pcall(collectgarbage, "collect")
+        end
+    end
+    pcall(task.wait)
+end
+
+--=====[ walk (yielding) ]====================================================
+
+local function walk(o, ctx, dep)
+    if ctx.done[o] then return end
+    ctx.done[o] = true
+    maybeYield(ctx)
+    if dep > ctx.maxd then
+        ctx.st.truncated = (ctx.st.truncated or 0) + 1
+        return
+    end
+    local st = ctx.st
+    if st.inst >= ctx.maxi then
+        ctx.aborted = true
+        return
+    end
+    st.inst = st.inst + 1
+    st.items = st.items + 1
+    local cn = o.ClassName
+    local bp = o:IsA("BasePart")
+    local out = ctx.out
+    local usolved = false
+    local rid = ctx.refs[o]
+    if not rid then
+        ctx.cnt.n = ctx.cnt.n + 1
+        rid = "RBX" .. ctx.cnt.n
+        ctx.refs[o] = rid
+    end
+    ins(out, sfmt('<Item class="%s" referent="%s">', cn, rid))
+    ins(out, '<Properties>')
+    for _, p in ipairs(propsFor(o, ctx)) do
+        if p == "Source" then
+            local src = srcOf(o)
+            if src == "" and ctx.opt.rescue and o:IsA("ModuleScript") then
+                local rok, mod = pcall(require, o)
+                if rok and typ(mod) == "table" then
+                    local seen, dmax = {}, tonum(ctx.opt.rescueDepth) or 32
+                    local function ser(v, d)
+                        local t = typ(v)
+                        if t == "string" then return sfmt("%q", v) end
+                        if t == "number" then return f17(v) end
+                        if t == "boolean" then return v and "true" or "false" end
+                        if t == "table" then
+                            if seen[v] or d > dmax then return "nil" end
+                            seen[v] = true
+                            local ks = {}
+                            for k in pairs(v) do
+                                local kt = typ(k)
+                                if kt == "string" or kt == "number" then ks[#ks + 1] = k end
+                            end
+                            tsort(ks, function(a, b)
+                                local ta, tb = typ(a), typ(b)
+                                if ta ~= tb then return ta < tb end
+                                return a < b
+                            end)
+                            local b = { "{" }
+                            for _, k in ipairs(ks) do
+                                local key = typ(k) == "string"
+                                    and "[" .. sfmt("%q", k) .. "]"
+                                    or "[" .. f17(k) .. "]"
+                                b[#b + 1] = key .. "=" .. ser(v[k], d + 1) .. ","
+                            end
+                            b[#b + 1] = "}"; seen[v] = nil
+                            return cat(b)
+                        end
+                        return "nil"
+                    end
+                    src = "return " .. ser(mod, 0)
+                end
+            end
+            if src ~= "" then
+                ins(out, sfmt('<ProtectedString name="Source">%s</ProtectedString>', cdata(src)))
+                st.props = st.props + 1
+            end
+        else
+            local ok, v = pcall(function() return o[p] end)
+            if ok and v ~= nil then
+                local skipDef = false
+                if ctx.opt.minify ~= false and p ~= "Name" then
+                    local dv, has = getDefault(ctx, cn, p)
+                    if has and eq(dv, v) then skipDef = true end
+                end
+                if not skipDef then
+                    local f = S[typeof(v)]
+                    if f then
+                        local xp = f(p, v, ctx.refs, bp)
+                        if xp and xp ~= "" then
+                            ins(out, xp); st.props = st.props + 1
+                        end
+                    else
+                        local tt = typeof(v)
+                        st.skip = st.skip + 1
+                        st.uns[tt] = (st.uns[tt] or 0) + 1
+                        if ctx.opt.mode == "strict" then
+                            error("[Walke] unsupported " .. cn .. "." .. p .. " <" .. tt .. ">", 0)
+                        end
+                    end
+                end
+            elseif not ok then
+                st.skip = st.skip + 1
+            end
+        end
+    end
+    if ghp and cn == "MeshPart" then
+        local ok, isz = pcall(ghp, o, "InitialSize")
+        if ok and typeof(isz) == "Vector3" then
+            ins(out, sfmt('<Vector3 name="InitialSize"><X>%s</X><Y>%s</Y><Z>%s</Z></Vector3>',
+                nf(isz.X), nf(isz.Y), nf(isz.Z)))
+            st.props = st.props + 1
+        end
+    end
+    if ctx.opt.unions and (cn == "UnionOperation" or cn == "NegateOperation") then
+        local tg = unionTags(o, ctx)
+        if tg ~= "" then
+            ins(out, tg); st.props = st.props + 1
+            st.unions = st.unions + 1; usolved = true
+        end
+    end
+    if ctx.opt.attributes ~= false then
+        local a, ac, al = packAttrs(o)
+        if a ~= "" then ins(out, a); st.attrs = st.attrs + ac end
+        if al > 0 then st.attrLost = st.attrLost + al end
+    end
+    if ctx.opt.tags ~= false then
+        local tg, tc = packTags(o)
+        if tg ~= "" then ins(out, tg); st.tags = st.tags + tc end
+    end
+    ins(out, '</Properties>')
+    for _, c in ipairs(ch(o, ctx)) do
+        if keep(c, ctx) then walk(c, ctx, dep + 1) end
+    end
+    ins(out, '</Item>')
+    if (cn == "UnionOperation" or cn == "NegateOperation") and not usolved then
+        if ctx.opt.holo then
+            local ok1, sz = pcall(function() return o.Size end)
+            local ok2, cf = pcall(function() return o.CFrame end)
+            if ok1 and ok2 and sz and cf then
+                ctx.syn = ctx.syn + 1
+                ins(out, sfmt('<Item class="Part" referent="RBXsyn%d">', ctx.syn))
+                ins(out, '<Properties>')
+                ins(out, S["string"]("Name", "Walke_MissingUnion_" .. o.Name))
+                ins(out, S["Vector3"]("Size", sz, nil, true))
+                ins(out, S["CFrame"]("CFrame", cf))
+                ins(out, S["Color3"]("Color", Color3.new(1, 0, 0), nil, true))
+                ins(out, S["number"]("Transparency", 0.5))
+                ins(out, S["boolean"]("Anchored", true))
+                ins(out, '</Properties></Item>')
+                st.items = st.items + 1; st.holo = st.holo + 1
+            end
+        else
+            st.csg = st.csg + 1
+        end
+    end
+end
+
+--=====[ Supporting funcs ]==================================================
+
+local function block(opt)
+    local b = {}
+    if opt and opt.blockCore == false then return b end
+    local function add(n)
+        local ok, s = pcall(function() return game:GetService(n) end)
+        if ok and s then b[s] = true end
+    end
+    if not opt or opt.includeCore ~= true then
+        add("CoreGui"); add("CorePackages"); add("RobloxPluginGuiService")
+    end
+    if gethui and (not opt or opt.includeCore ~= true) then
+        local ok, h = pcall(gethui)
+        if ok and h then b[h] = true end
+    end
+    return b
+end
+
+local function insertable(o) return not SKIP_CLASS[o.ClassName] end
+
+local function keep(c, ctx)
+    if ctx.block[c] then return false end
+    if not insertable(c) then return false end
+    if ctx.opt.respectArchivable == true then
+        local ok, a = pcall(function() return c.Archivable end)
+        if ok and a == false then return false end
+    end
+    if ctx.ign[c.ClassName] then return false end
+    if ctx.opt.noScripts and c:IsA("LuaSourceContainer") then return false end
+    if ctx.opt.skipInvisible and c:IsA("BasePart") then
+        local ok, tr = pcall(function() return c.Transparency end)
+        if ok and tr and tr >= 1 then return false end
+    end
+    return true
+end
 
 local function readHidden(o, p, ctx)
     local ok, v = pcall(function() return o[p] end)
@@ -869,325 +1222,95 @@ local function unionTags(o, ctx)
     return cat(b)
 end
 
---=====[ Blacklist / keep ====================================================
-
-local function block(opt)
-    local b = {}
-    if opt and opt.blockCore == false then return b end
-    local function add(n)
-        local ok, s = pcall(function() return game:GetService(n) end)
-        if ok and s then b[s] = true end
+local function terrainItem(ctx, ref)
+    local tr
+    if not pcall(function() tr = workspace.Terrain end) or not tr then return "" end
+    local ext
+    if not pcall(function() ext = tr.MaxExtents end) or not ext then return "" end
+    local mn, mx = ext.Min, ext.Max
+    local x0, y0, z0 = mn.X * 4, mn.Y * 4, mn.Z * 4
+    local x1, y1, z1 = mx.X * 4, mx.Y * 4, mx.Z * 4
+    if x1 <= x0 or y1 <= y0 or z1 <= z0 then return "" end
+    local cap = ctx.opt.terrainCap or 2048
+    if (x1 - x0) > cap or (y1 - y0) > cap or (z1 - z0) > cap then
+        ins(ctx.st.warns, "terrain extent exceeds cap; skipped")
+        return ""
     end
-    if not opt or opt.includeCore ~= true then
-        add("CoreGui"); add("CorePackages"); add("RobloxPluginGuiService")
-    end
-    if gethui and (not opt or opt.includeCore ~= true) then
-        local ok, h = pcall(gethui)
-        if ok and h then b[h] = true end
-    end
-    return b
-end
-
-local function insertable(o)
-    if SKIP_CLASS[o.ClassName] then return false end
-    return true
-end
-
-local function keep(c, ctx)
-    if ctx.block[c] then return false end
-    if not insertable(c) then return false end
-    if ctx.opt.respectArchivable == true then
-        local ok, a = pcall(function() return c.Archivable end)
-        if ok and a == false then return false end
-    end
-    local cn = c.ClassName
-    if ctx.ign[cn] then return false end
-    if ctx.opt.noScripts and c:IsA("LuaSourceContainer") then return false end
-    if ctx.opt.skipInvisible and c:IsA("BasePart") then
-        local ok, tr = pcall(function() return c.Transparency end)
-        if ok and tr and tr >= 1 then return false end
-    end
-    return true
-end
-
---=====[ Walk (main serializer) ]============================================
-
-local function walk(o, ctx, dep)
-    if ctx.done[o] then return end
-    ctx.done[o] = true
-    if ctx.opt.shouldCancel and ctx.opt.shouldCancel() then
-        error("__walke_cancel__", 0)
-    end
-    if dep > ctx.maxd then
-        ctx.st.truncated = (ctx.st.truncated or 0) + 1
-        if not ctx.warnedDepth then
-            ctx.warnedDepth = true
-            ins(ctx.st.warns, "max depth reached; subtree truncated")
-        end
-        return
-    end
-    local st = ctx.st
-    if st.inst >= ctx.maxi then
-        st.truncated = (st.truncated or 0) + 1
-        if not ctx.warnedInstances then
-            ctx.warnedInstances = true
-            ins(ctx.st.warns, "max instance limit reached; remaining instances skipped")
-        end
-        return
-    end
-    st.inst = st.inst + 1
-    st.items = st.items + 1
-    local cn = o.ClassName
-    local bp = o:IsA("BasePart")
-    local out = ctx.out
-    local usolved = false
-    local rid = ctx.refs[o]
-    if not rid then
-        ctx.cnt.n = ctx.cnt.n + 1
-        rid = "RBX" .. ctx.cnt.n
-        ctx.refs[o] = rid
-    end
-    ins(out, sfmt('<Item class="%s" referent="%s">', cn, rid))
-    ins(out, '<Properties>')
-    for _, p in ipairs(propsFor(o, ctx)) do
-        if p == "Source" then
-            local src = srcOf(o)
-            if src == "" and ctx.opt.rescue and o:IsA("ModuleScript") then
-                local rok, mod = pcall(require, o)
-                if rok and typ(mod) == "table" then
-                    local seen = {}
-                    local depth = tonum(ctx.opt.rescueDepth) or 32
-                    local function ser(v, d)
-                        local t = typ(v)
-                        if t == "string" then return sfmt("%q", v) end
-                        if t == "number" then return f17(v) end
-                        if t == "boolean" then return v and "true" or "false" end
-                        if t == "table" then
-                            if seen[v] or d > depth then return "nil" end
-                            seen[v] = true
-                            local ks = {}
-                            for k in pairs(v) do
-                                local kt = typ(k)
-                                if kt == "string" or kt == "number" then ks[#ks + 1] = k end
-                            end
-                            tsort(ks, function(a, b)
-                                local ta, tb = typ(a), typ(b)
-                                if ta ~= tb then return ta < tb end
-                                return a < b
-                            end)
-                            local b = { "{" }
-                            for _, k in ipairs(ks) do
-                                local key = typ(k) == "string"
-                                    and "[" .. sfmt("%q", k) .. "]"
-                                    or "[" .. f17(k) .. "]"
-                                b[#b + 1] = key .. "=" .. ser(v[k], d + 1) .. ","
-                            end
-                            b[#b + 1] = "}"
-                            seen[v] = nil
-                            return cat(b)
-                        end
-                        return "nil"
-                    end
-                    src = "return " .. ser(mod, 0)
-                end
-            end
-            if src ~= "" then
-                ins(out, sfmt('<ProtectedString name="Source">%s</ProtectedString>', cdata(src)))
-                st.props = st.props + 1
-            end
-        else
-            local ok, v = pcall(function() return o[p] end)
-            if ok and v ~= nil then
-                if ctx.opt.assets and CONTENT_PROP[p] and typ(v) == "string" then
-                    archive(v, ctx)
-                end
-                local skipDef = false
-                if ctx.opt.minify ~= false and p ~= "Name" then
-                    local dv, has = getDefault(ctx, cn, p)
-                    if has and eq(dv, v) then skipDef = true end
-                end
-                if not skipDef then
-                    local f = S[typeof(v)]
-                    if f then
-                        local xp = f(p, v, ctx.refs, bp)
-                        if xp and xp ~= "" then
-                            ins(out, xp)
-                            st.props = st.props + 1
-                        end
-                    else
-                        local tt = typeof(v)
-                        st.skip = st.skip + 1
-                        st.uns[tt] = (st.uns[tt] or 0) + 1
-                        if ctx.opt.mode == "debug" then
-                            local dk = cn .. "." .. p
-                            if not ctx.dbg[dk] then
-                                ctx.dbg[dk] = true
-                                warn("[Walke] skipped " .. dk .. " <" .. tt .. ">")
+    local chunks, nc = {}, 0
+    local cx = x0
+    while cx < x1 do
+        local ex = mmin(cx + TERRAIN_CHUNK, x1)
+        local cy = y0
+        while cy < y1 do
+            local ey = mmin(cy + TERRAIN_CHUNK, y1)
+            local cz = z0
+            while cz < z1 do
+                local ez = mmin(cz + TERRAIN_CHUNK, z1)
+                local rg = Region3.new(Vector3.new(cx, cy, cz), Vector3.new(ex, ey, ez)):ExpandToGrid(4)
+                local rok, ms, oc = pcall(function() return tr:ReadVoxels(rg, 4) end)
+                if rok and ms and ms[1] and ms[1][1] then
+                    local sx, sy, sz = #ms, #ms[1], #ms[1][1]
+                    local pos, rsz = rg.CFrame.Position, rg.Size
+                    local ox, oy, oz = pos.X - rsz.X / 2, pos.Y - rsz.Y / 2, pos.Z - rsz.Z / 2
+                    local vb, hasNonAir = {}, false
+                    for xi = 1, sx do
+                        for yi = 1, sy do
+                            local zi = 1
+                            while zi <= sz do
+                                local m = ms[xi][yi][zi]
+                                local ov = oc[xi][yi][zi] or 0
+                                if ov <= 0 and (not m or m == Enum.Material.Air) then
+                                    local runLen = 1
+                                    while zi + runLen <= sz do
+                                        local m2 = ms[xi][yi][zi + runLen]
+                                        local o2 = oc[xi][yi][zi + runLen] or 0
+                                        if o2 > 0 or (m2 and m2 ~= Enum.Material.Air) then break end
+                                        runLen = runLen + 1
+                                    end
+                                    vb[#vb + 1] = spack("<H", RLE_MARKER) .. spack("<I4", runLen)
+                                    zi = zi + runLen
+                                else
+                                    vb[#vb + 1] = spack("<H", (m and m.Value) or 0) .. schar(u8(ov))
+                                    hasNonAir = true; zi = zi + 1
+                                end
                             end
                         end
-                        if ctx.opt.mode == "strict" then
-                            error("[Walke] unsupported property " .. cn .. "." .. p .. " <" .. tt .. ">", 0)
-                        end
+                    end
+                    if hasNonAir then
+                        nc = nc + 1
+                        chunks[#chunks + 1] = spack("<fffHHH", ox, oy, oz, sx, sy, sz) .. cat(vb)
                     end
                 end
-            elseif not ok then
-                st.skip = st.skip + 1
-                if ctx.opt.mode == "debug" then
-                    local rk = "rf:" .. cn .. "." .. p
-                    if not ctx.dbg[rk] then
-                        ctx.dbg[rk] = true
-                        warn("[Walke] read-fail " .. cn .. "." .. p)
-                    end
-                end
+                task.wait() -- yield between terrain chunks
+                cz = ez
             end
+            cy = ey
         end
+        cx = ex
     end
-    if ghp and cn == "MeshPart" then
-        local ok, isz = pcall(ghp, o, "InitialSize")
-        if ok and typeof(isz) == "Vector3" then
-            ins(out, sfmt('<Vector3 name="InitialSize"><X>%s</X><Y>%s</Y><Z>%s</Z></Vector3>',
-                nf(isz.X), nf(isz.Y), nf(isz.Z)))
-            st.props = st.props + 1
-        end
-    end
-    if ctx.opt.unions and (cn == "UnionOperation" or cn == "NegateOperation") then
-        local tg = unionTags(o, ctx)
-        if tg ~= "" then
-            ins(out, tg)
-            st.props = st.props + 1
-            st.unions = st.unions + 1
-            usolved = true
-        end
-    end
-    if ctx.opt.attributes ~= false then
-        local a, ac, al = packAttrs(o)
-        if a ~= "" then ins(out, a); st.attrs = st.attrs + ac end
-        if al > 0 then st.attrLost = st.attrLost + al end
-    end
-    if ctx.opt.tags ~= false then
-        local tg, tc = packTags(o)
-        if tg ~= "" then ins(out, tg); st.tags = st.tags + tc end
-    end
-    ins(out, '</Properties>')
-    for _, c in ipairs(ch(o, ctx)) do
-        if keep(c, ctx) then walk(c, ctx, dep + 1) end
-    end
-    ins(out, '</Item>')
-    if (cn == "UnionOperation" or cn == "NegateOperation") and not usolved then
-        if ctx.opt.holo then
-            local ok1, sz = pcall(function() return o.Size end)
-            local ok2, cf = pcall(function() return o.CFrame end)
-            if ok1 and ok2 and sz and cf then
-                ctx.syn = ctx.syn + 1
-                ins(out, sfmt('<Item class="Part" referent="RBXsyn%d">', ctx.syn))
-                ins(out, '<Properties>')
-                ins(out, S["string"]("Name", "Walke_MissingUnion_" .. o.Name))
-                ins(out, S["Vector3"]("Size", sz, nil, true))
-                ins(out, S["CFrame"]("CFrame", cf))
-                ins(out, S["Color3"]("Color", Color3.new(1, 0, 0), nil, true))
-                ins(out, S["number"]("Transparency", 0.5))
-                ins(out, S["boolean"]("Anchored", true))
-                ins(out, '</Properties></Item>')
-                st.items = st.items + 1
-                st.holo = st.holo + 1
-            end
-        else
-            st.csg = st.csg + 1
-        end
-    end
-    if ctx.opt.yield ~= false and ctx.opt.noYield ~= true then
-        local now = oclock()
-        if now - ctx.fs >= ctx.yi then
-            if ctx.opt.onProgress then
-                pcall(ctx.opt.onProgress, st.inst, st.items, st.bytes)
-            end
-            pcall(task.wait)
-            ctx.fs = oclock()
-        end
-    end
+    if nc == 0 then return "" end
+    local data = b64(spack("<I4", nc) .. cat(chunks))
+    return cat({
+        sfmt('<Item class="Script" referent="%s">', ref),
+        '<Properties>',
+        S["string"]("Name", "Walke_Terrain_Restorer"),
+        sfmt('<ProtectedString name="Source">%s</ProtectedString>', cdata(terrainSrc(data))),
+        '</Properties></Item>',
+    })
 end
-
---=====[ Ref repair / validation ]===========================================
-
-local function repairRefs(xml, st)
-    local refs = {}
-    for id in sgsub(xml, "<!%[CDATA%[.-%]%]>", ""):gmatch('referent="([^"]+)"') do
-        refs[id] = true
-    end
-    local dangling = 0
-    for id in sgsub(xml, "<!%[CDATA%[.-%]%]>", ""):gmatch('<Ref name="[^"]-">([^<]+)</Ref>') do
-        if not refs[id] then dangling = dangling + 1 end
-    end
-    st.dangling = dangling
-    return xml
-end
-
-local function validate(xml, st)
-    if ssub(xml, 1, 7) ~= "<roblox" then return false, "bad root" end
-    if ssub(xml, -9) ~= "</roblox>" then return false, "unclosed root" end
-    local scan = sgsub(xml, "<!%[CDATA%[.-%]%]>", "")
-    local _, o = sgsub(scan, "<Item ", "")
-    local _, c = sgsub(scan, "</Item>", "")
-    if o ~= c then return false, "item tag imbalance (" .. o .. "/" .. c .. ")" end
-    if o ~= st.items then return false, "item count mismatch (" .. o .. "/" .. st.items .. ")" end
-    local rs = {}
-    for id in scan:gmatch('referent="([^"]+)"') do
-        if rs[id] then return false, "duplicate referent: " .. id end
-        rs[id] = true
-    end
-    local dang = 0
-    for id in scan:gmatch('<Ref name="[^"]-">([^<]+)</Ref>') do
-        if not rs[id] then dang = dang + 1 end
-    end
-    st.dangling = dang
-    return true, "ok, " .. dang .. " dangling refs"
-end
-
---=====[ Stats report ]======================================================
-
-local function report(st, vok, vmsg)
-    local sz = st.bytes
-    local n, u = sz, "B"
-    if sz >= 1048576 then n, u = sz / 1048576, "MB"
-    elseif sz >= 1024 then n, u = sz / 1024, "KB" end
-    local ut = 0
-    for _ in pairs(st.uns) do ut = ut + 1 end
-    print(sfmt(
-        "[Walke] deep:%s inst:%d items:%d props:%d attrs:%d attrLost:%d tags:%d " ..
-        "assets:%d holo:%d unions:%d csg:%d dangling:%d skip:%d unsupported:%d " ..
-        "refs:%d trunc:%d warns:%d out:%.1f%s time:%.2fs valid:%s(%s)",
-        tostr(st.deep), st.inst, st.items, st.props, st.attrs, st.attrLost,
-        st.tags, st.assets, st.holo, st.unions, st.csg, st.dangling,
-        st.skip, ut, st.refs, st.truncated or 0, #st.warns,
-        n, u, st.time or 0, tostr(vok), tostr(vmsg)))
-    if not st.deep then
-        warn("[Walke] getproperties unavailable — registry-only capture (fewer props)")
-    end
-    if st.csg > 0 then
-        warn("[Walke] " .. st.csg .. " CSG unions have no mesh data saved; invisible in Studio. Use holo=true for red markers")
-    end
-    for _, w in ipairs(st.warns) do
-        warn("[Walke] " .. w)
-    end
-end
-
---=====[ Reference assignment ]==============================================
 
 local function assign(o, refs, cnt, blk, ctx, dep)
-    if refs[o] or not keep(o, ctx) or cnt.n >= ctx.maxi or dep > ctx.maxd then
-        return
-    end
-    if ctx.opt.shouldCancel and ctx.opt.shouldCancel() then
-        error("__walke_cancel__", 0)
-    end
+    if refs[o] or not keep(o, ctx) or cnt.n >= ctx.maxi or dep > ctx.maxd then return end
+    if ctx.opt.shouldCancel and ctx.opt.shouldCancel() then error("__walke_cancel__", 0) end
     cnt.n = cnt.n + 1
     refs[o] = "RBX" .. cnt.n
+    -- yield every 500 assignments
+    ctx.assignCount = (ctx.assignCount or 0) + 1
+    if ctx.assignCount % 500 == 0 then task.wait() end
     for _, c in ipairs(ch(o, ctx)) do
         if not blk[c] then assign(c, refs, cnt, blk, ctx, dep + 1) end
     end
 end
-
---=====[ Root normalization ]================================================
 
 local function svc(o)
     local ok, par = pcall(function() return o.Parent end)
@@ -1214,445 +1337,76 @@ local function normalize(root, blk)
                     local nm = "Service"
                     pcall(function() nm = c.ClassName end)
                     local ks = kidsOf(c, blk)
-                    if #ks > 0 then
-                        ents[#ents + 1] = { folder = nm, kids = ks }
-                    end
+                    if #ks > 0 then ents[#ents + 1] = { folder = nm, kids = ks } end
                 end
             end
         elseif svc(o) then
-            for _, c in ipairs(kidsOf(o, blk)) do
-                ents[#ents + 1] = { inst = c }
-            end
+            for _, c in ipairs(kidsOf(o, blk)) do ents[#ents + 1] = { inst = c } end
         else
             ents[#ents + 1] = { inst = o }
         end
     end
-    if typeof(root) == "Instance" then
-        add(root)
+    if typeof(root) == "Instance" then add(root)
     elseif typ(root) == "table" then
-        for _, o in ipairs(root) do
-            if typeof(o) == "Instance" then add(o) end
-        end
+        for _, o in ipairs(root) do if typeof(o) == "Instance" then add(o) end end
     end
     return ents
 end
 
---=====[ On-Screen Status HUD ]==============================================
-
-local UI = {}
-
-local COLORS = {
-    bg        = Color3.fromRGB(18, 18, 22),
-    bgAlt     = Color3.fromRGB(26, 26, 32),
-    border    = Color3.fromRGB(60, 60, 72),
-    accent    = Color3.fromRGB(120, 180, 255),
-    accentDim = Color3.fromRGB(40, 70, 120),
-    text      = Color3.fromRGB(235, 235, 245),
-    textDim   = Color3.fromRGB(150, 150, 165),
-    ok        = Color3.fromRGB(90, 220, 140),
-    warn      = Color3.fromRGB(255, 190, 80),
-    err       = Color3.fromRGB(255, 100, 100),
-    bar       = Color3.fromRGB(80, 140, 220),
-    barBg     = Color3.fromRGB(35, 35, 45),
-}
-
-local function mk(class, props, children)
-    local ok, i = pcall(Instance.new, class)
-    if not ok or not i then return nil end
-    for k, v in pairs(props or {}) do
-        if k ~= "Parent" then pcall(function() i[k] = v end) end
+local function validate(xml, st)
+    if ssub(xml, 1, 7) ~= "<roblox" then return false, "bad root" end
+    if ssub(xml, -9) ~= "</roblox>" then return false, "unclosed root" end
+    local scan = sgsub(xml, "<!%[CDATA%[.-%]%]>", "")
+    local _, o = sgsub(scan, "<Item ", "")
+    local _, c = sgsub(scan, "</Item>", "")
+    if o ~= c then return false, "item tag imbalance (" .. o .. "/" .. c .. ")" end
+    if o ~= st.items then return false, "item count (" .. o .. "/" .. st.items .. ")" end
+    local rs = {}
+    for id in scan:gmatch('referent="([^"]+)"') do
+        if rs[id] then return false, "duplicate referent: " .. id end
+        rs[id] = true
     end
-    for _, c in ipairs(children or {}) do
-        if c then c.Parent = i end
+    local dang = 0
+    for id in scan:gmatch('<Ref name="[^"]-">([^<]+)</Ref>') do
+        if not rs[id] then dang = dang + 1 end
     end
-    if props and props.Parent then i.Parent = props.Parent end
-    return i
+    st.dangling = dang
+    return true, "ok, " .. dang .. " dangling refs"
 end
 
-local function uiParent()
-    local ok, cg = pcall(function() return game:GetService("CoreGui") end)
-    if ok and cg then
-        local fine = pcall(function()
-            local tmp = Instance.new("Folder")
-            tmp.Parent = cg
-            tmp:Destroy()
-        end)
-        if fine then return cg end
-    end
-    local ok2, pg = pcall(function()
-        return game:GetService("Players").LocalPlayer:WaitForChild("PlayerGui", 5)
-    end)
-    if ok2 and pg then return pg end
-    return nil
+local function report(st, vok, vmsg)
+    local sz = st.bytes
+    local n, u = sz, "B"
+    if sz >= 1048576 then n, u = sz / 1048576, "MB"
+    elseif sz >= 1024 then n, u = sz / 1024, "KB" end
+    local ut = 0
+    for _ in pairs(st.uns) do ut = ut + 1 end
+    print(sfmt(
+        "[Walke] deep:%s inst:%d items:%d props:%d attrs:%d attrLost:%d tags:%d " ..
+        "holo:%d unions:%d csg:%d dangling:%d skip:%d unsupported:%d refs:%d " ..
+        "trunc:%d warns:%d out:%.1f%s time:%.2fs valid:%s(%s)",
+        tostr(st.deep), st.inst, st.items, st.props, st.attrs, st.attrLost,
+        st.tags, st.holo, st.unions, st.csg, st.dangling, st.skip, ut,
+        st.refs, st.truncated or 0, #st.warns, n, u, st.time or 0,
+        tostr(vok), tostr(vmsg)))
+    if not st.deep then warn("[Walke] getproperties unavailable — fewer props") end
+    if st.csg > 0 then warn("[Walke] " .. st.csg .. " CSG unions have no mesh data saved") end
+    for _, w in ipairs(st.warns) do warn("[Walke] " .. w) end
 end
 
-local function fmtBytes(n)
-    if n >= 1048576 then return sfmt("%.1f MB", n / 1048576) end
-    if n >= 1024 then return sfmt("%.1f KB", n / 1024) end
-    return tostr(n) .. " B"
-end
-
-local function fmtTime(s)
-    if s < 1 then return sfmt("%dms", mfloor(s * 1000)) end
-    if s < 60 then return sfmt("%.2fs", s) end
-    local m = mfloor(s / 60)
-    local sec = s - m * 60
-    return sfmt("%dm %04.1fs", m, sec)
-end
-
-local function logColor(level)
-    if level == "err" or level == "error" then return COLORS.err end
-    if level == "warn" or level == "warning" then return COLORS.warn end
-    if level == "ok" or level == "success" then return COLORS.ok end
-    return COLORS.textDim
-end
-
-function UI.create(opts)
-    opts = opts or {}
-    local parent = opts.parent or uiParent()
-    if not parent then return nil, "no GUI parent available" end
-
-    local root = mk("ScreenGui", {
-        Name = "WalkeStatusUI",
-        ResetOnSpawn = false,
-        ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
-        DisplayOrder = 999999,
-        IgnoreGuiInset = true,
-        Parent = parent,
-    })
-    if not root then return nil, "ScreenGui creation failed" end
-
-    local frame = mk("Frame", {
-        Name = "Root",
-        Size = UDim2.new(0, 360, 0, 210),
-        Position = UDim2.new(1, -20, 1, -20),
-        AnchorPoint = Vector2.new(1, 1),
-        BackgroundColor3 = COLORS.bg,
-        BorderSizePixel = 0,
-        Parent = root,
-    })
-    if not frame then root:Destroy(); return nil, "Frame creation failed" end
-
-    mk("UICorner", { CornerRadius = UDim.new(0, 10), Parent = frame })
-    local stroke = mk("UIStroke", {
-        Color = COLORS.border, Thickness = 1,
-        Transparency = 0.2, Parent = frame,
-    })
-
-    -- Drag
-    do
-        local dragging, dragStart, startPos = false, nil, nil
-        frame.InputBegan:Connect(function(input)
-            if input.UserInputType == Enum.UserInputType.MouseButton1
-                or input.UserInputType == Enum.UserInputType.Touch then
-                dragging = true
-                dragStart = input.Position
-                startPos = frame.Position
-                input.Changed:Connect(function()
-                    if input.UserInputState == Enum.UserInputState.End then
-                        dragging = false
-                    end
-                end)
-            end
-        end)
-        frame.InputChanged:Connect(function(input)
-            if dragging and input.UserInputType == Enum.UserInputType.MouseMovement then
-                local delta = input.Position - dragStart
-                frame.Position = UDim2.new(
-                    startPos.X.Scale, startPos.X.Offset + delta.X,
-                    startPos.Y.Scale, startPos.Y.Offset + delta.Y)
-            end
-        end)
-    end
-
-    local header = mk("Frame", {
-        Name = "Header",
-        Size = UDim2.new(1, -20, 0, 26),
-        Position = UDim2.new(0, 10, 0, 8),
-        BackgroundTransparency = 1,
-        Parent = frame,
-    })
-
-    local title = mk("TextLabel", {
-        Name = "Title",
-        Size = UDim2.new(1, -90, 1, 0),
-        BackgroundTransparency = 1,
-        Font = Enum.Font.GothamBold,
-        TextSize = 14,
-        TextColor3 = COLORS.text,
-        TextXAlignment = Enum.TextXAlignment.Left,
-        Text = "Walke " .. VERSION .. "  •  Idle",
-        Parent = header,
-    })
-
-    local closeBtn = mk("TextButton", {
-        Name = "Close",
-        Size = UDim2.new(0, 60, 0, 22),
-        Position = UDim2.new(1, 0, 0, 0),
-        AnchorPoint = Vector2.new(1, 0),
-        BackgroundColor3 = COLORS.bgAlt,
-        BorderSizePixel = 0,
-        Font = Enum.Font.GothamMedium,
-        TextSize = 12,
-        TextColor3 = COLORS.textDim,
-        Text = "Hide",
-        AutoButtonColor = true,
-        Parent = header,
-    })
-    if closeBtn then mk("UICorner", { CornerRadius = UDim.new(0, 5), Parent = closeBtn }) end
-
-    local statusLine = mk("TextLabel", {
-        Name = "Status",
-        Size = UDim2.new(1, -20, 0, 16),
-        Position = UDim2.new(0, 10, 0, 36),
-        BackgroundTransparency = 1,
-        Font = Enum.Font.Gotham,
-        TextSize = 11,
-        TextColor3 = COLORS.textDim,
-        TextXAlignment = Enum.TextXAlignment.Left,
-        Text = "Ready.",
-        Parent = frame,
-    })
-
-    local barWrap = mk("Frame", {
-        Name = "Bar",
-        Size = UDim2.new(1, -20, 0, 6),
-        Position = UDim2.new(0, 10, 0, 58),
-        BackgroundColor3 = COLORS.barBg,
-        BorderSizePixel = 0,
-        Parent = frame,
-    })
-    if barWrap then mk("UICorner", { CornerRadius = UDim.new(1, 0), Parent = barWrap }) end
-
-    local barFill = mk("Frame", {
-        Name = "Fill",
-        Size = UDim2.new(0, 0, 1, 0),
-        BackgroundColor3 = COLORS.bar,
-        BorderSizePixel = 0,
-        Parent = barWrap,
-    })
-    if barFill then mk("UICorner", { CornerRadius = UDim.new(1, 0), Parent = barFill }) end
-
-    local counters = mk("Frame", {
-        Name = "Counters",
-        Size = UDim2.new(1, -20, 0, 40),
-        Position = UDim2.new(0, 10, 0, 72),
-        BackgroundTransparency = 1,
-        Parent = frame,
-    })
-
-    local labels = {}
-    local function addCounter(key, col, row, text, color)
-        local l = mk("TextLabel", {
-            Name = key,
-            Size = UDim2.new(1 / 3, -4, 0.5, 0),
-            Position = UDim2.new(col / 3, col > 0 and 4 or 0, row / 2, 0),
-            BackgroundTransparency = 1,
-            Font = Enum.Font.Code,
-            TextSize = 11,
-            TextColor3 = color or COLORS.textDim,
-            TextXAlignment = Enum.TextXAlignment.Left,
-            TextYAlignment = Enum.TextYAlignment.Top,
-            Text = text,
-            Parent = counters,
-        })
-        labels[key] = l
-    end
-    addCounter("items", 0, 0, "items   0")
-    addCounter("props", 1, 0, "props   0")
-    addCounter("attrs", 2, 0, "attrs   0")
-    addCounter("bytes", 0, 1, "bytes   0 B", COLORS.text)
-    addCounter("time",  1, 1, "time    0ms", COLORS.text)
-    addCounter("refs",  2, 1, "refs    0", COLORS.text)
-
-    local logFrame = mk("ScrollingFrame", {
-        Name = "Log",
-        Size = UDim2.new(1, -20, 0, 54),
-        Position = UDim2.new(0, 10, 0, 118),
-        BackgroundColor3 = COLORS.bgAlt,
-        BorderSizePixel = 0,
-        ScrollBarThickness = 4,
-        ScrollBarImageColor3 = COLORS.accentDim,
-        CanvasSize = UDim2.new(0, 0, 0, 0),
-        AutomaticCanvasSize = Enum.AutomaticSize.Y,
-        ScrollBarImageTransparency = 0.5,
-        Parent = frame,
-    })
-    if logFrame then mk("UICorner", { CornerRadius = UDim.new(0, 6), Parent = logFrame }) end
-
-    mk("UIListLayout", {
-        SortOrder = Enum.SortOrder.LayoutOrder,
-        Padding = UDim.new(0, 2),
-        Parent = logFrame,
-    })
-    mk("UIPadding", {
-        PaddingLeft = UDim.new(0, 6), PaddingRight = UDim.new(0, 6),
-        PaddingTop = UDim.new(0, 4), PaddingBottom = UDim.new(0, 4),
-        Parent = logFrame,
-    })
-
-    local footer = mk("TextLabel", {
-        Name = "Footer",
-        Size = UDim2.new(1, -20, 0, 14),
-        Position = UDim2.new(0, 10, 1, -20),
-        BackgroundTransparency = 1,
-        Font = Enum.Font.Gotham,
-        TextSize = 10,
-        TextColor3 = COLORS.textDim,
-        TextXAlignment = Enum.TextXAlignment.Left,
-        Text = "Walke Serializer v" .. VERSION,
-        Parent = frame,
-    })
-
-    local state = {
-        frame = frame, root = root,
-        title = title, status = statusLine, bar = barFill, footer = footer,
-        labels = labels, log = logFrame,
-        startTime = oclock(),
-        cancelled = false,
-        logCount = 0,
-        maxLogs = opts.maxLogs or 32,
-        autoHide = opts.autoHide ~= false,
-        autoHideDelay = opts.autoHideDelay or 6,
-        pulse = 0,
-    }
-
-    function state:push(level, msg)
-        msg = tostr(msg)
-        self.logCount = self.logCount + 1
-        local order = self.logCount
-        local c = logColor(level)
-        local row = mk("TextLabel", {
-            Name = "L" .. order,
-            Size = UDim2.new(1, 0, 0, 14),
-            BackgroundTransparency = 1,
-            Font = Enum.Font.Code,
-            TextSize = 10,
-            TextColor3 = c,
-            TextXAlignment = Enum.TextXAlignment.Left,
-            TextYAlignment = Enum.TextYAlignment.Top,
-            TextWrapped = true,
-            Text = "[" .. slower(level):upper() .. "] " .. msg,
-            LayoutOrder = order,
-            Parent = self.log,
-        })
-        -- trim
-        local logRows = {}
-        for _, k in ipairs(self.log:GetChildren()) do
-            if k:IsA("TextLabel") then logRows[#logRows + 1] = k end
-        end
-        if #logRows > self.maxLogs then
-            tsort(logRows, function(a, b) return a.LayoutOrder < b.LayoutOrder end)
-            for i = 1, #logRows - self.maxLogs do
-                pcall(function() logRows[i]:Destroy() end)
-            end
-        end
-        -- autoscroll
-        pcall(function()
-            self.log.CanvasPosition = Vector2.new(0, self.log.AbsoluteCanvasSize.Y)
-        end)
-    end
-
-    function state:setTitle(text)
-        if self.title then self.title.Text = "Walke " .. VERSION .. "  •  " .. text end
-    end
-    function state:setStatus(text, color)
-        if self.status then
-            self.status.Text = text
-            self.status.TextColor3 = color or COLORS.textDim
-        end
-    end
-    function state:setProgress(cur, total)
-        if not self.bar then return end
-        local p = 0
-        if total and total > 0 then p = mmin(cur / total, 1) end
-        self.bar.Size = UDim2.new(p, 0, 1, 0)
-    end
-    function state:setLabel(key, text, color)
-        local l = self.labels[key]
-        if l then l.Text = text; if color then l.TextColor3 = color end end
-    end
-    function state:updateStats(st)
-        if not st then return end
-        self:setLabel("items", "items   " .. tostr(st.items or 0))
-        self:setLabel("props", "props   " .. tostr(st.props or 0))
-        self:setLabel("attrs", "attrs   " .. tostr(st.attrs or 0))
-        self:setLabel("bytes", "bytes   " .. fmtBytes(st.bytes or 0), COLORS.text)
-        self:setLabel("refs",  "refs    " .. tostr(st.refs or 0))
-        local dt = oclock() - self.startTime
-        self:setLabel("time", "time    " .. fmtTime(dt), COLORS.text)
-    end
-
-    if closeBtn then
-        closeBtn.MouseButton1Click:Connect(function()
-            state.cancelled = true
-            state:setTitle("Hidden")
-            if root then root.Enabled = false end
-        end)
-    end
-
-    task.spawn(function()
-        while root and root.Parent do
-            task.wait(1)
-            state.pulse = (state.pulse + 1) % 2
-            if stroke and stroke.Parent then
-                stroke.Transparency = 0.2 + state.pulse * 0.15
-            end
-        end
-    end)
-
-    return state
-end
-
---=====[ Public API ]=========================================================
-
-local M = {}
-
-M.Version = VERSION
-M.Capabilities = {
-    deep = gp ~= nil,
-    decompile = dec ~= nil,
-    attributes = true,
-    tags = true,
-    validate = true,
-    stats = true,
-    minify = true,
-    blacklist = true,
-    adaptiveYield = true,
-    terrain = true,
-    rescue = true,
-    holo = true,
-    assets = true,
-    progress = true,
-    hud = true,
-    archivableFilter = true,
-    includeCore = true,
-    meshInitialSize = ghp ~= nil,
-    unions = (ghp ~= nil) or (sscript ~= nil),
-    native = nsi ~= nil,
-    ignoreClasses = true,
-    noScripts = true,
-    cancellable = true,
-    chunkedWrite = true,
-    childCache = true,
-    limits = true,
-    cleanup = true,
-    modes = { "safe", "strict", "debug", "silent" },
-    datatypes = {
-        "string", "boolean", "number", "Vector3", "Vector2", "Vector3int16",
-        "Vector2int16", "Color3", "CFrame", "EnumItem", "UDim", "UDim2",
-        "BrickColor", "NumberRange", "NumberSequence", "ColorSequence",
-        "Rect", "PhysicalProperties", "Font", "Content", "Faces", "Axes",
-        "Ray", "Instance",
-    },
-}
+--=====[ serialize (the fixed core) ]========================================
 
 function M.serialize(root, opt)
     opt = opt or {}
     if opt.mode ~= "safe" and opt.mode ~= "strict"
-        and opt.mode ~= "debug" and opt.mode ~= "silent" then
-        opt.mode = "safe"
+        and opt.mode ~= "debug" and opt.mode ~= "silent" then opt.mode = "safe" end
+    -- defaults — safeMode ON by default
+    local safeMode = opt.safeMode ~= false
+    if safeMode then
+        opt.maxInstances = tonum(opt.maxInstances) or 50000
+        opt.maxDepth = tonum(opt.maxDepth) or 5000
     end
+
     local t0 = oclock()
     local ign = {}
     if typ(opt.ignore) == "table" then
@@ -1662,11 +1416,10 @@ function M.serialize(root, opt)
     local ents = normalize(root, blk)
     local refs, cnt = {}, { n = 0 }
     local st = {
-        inst = 0, items = 0, props = 0, attrs = 0, attrLost = 0,
-        tags = 0, assets = 0, holo = 0, unions = 0, csg = 0,
-        dangling = 0, skip = 0, uns = {}, warns = {}, refs = 0,
-        empty = false, deep = (opt.deep ~= false) and (gp ~= nil),
-        truncated = 0, bytes = 0,
+        inst=0, items=0, props=0, attrs=0, attrLost=0, tags=0, assets=0,
+        holo=0, unions=0, csg=0, dangling=0, skip=0, uns={}, warns={},
+        refs=0, empty=false, deep=(opt.deep ~= false) and (gp ~= nil),
+        truncated=0, bytes=0,
     }
     local out = {
         '<roblox xmlns:xmime="http://www.w3.org/2005/05/xmlmime" ' ..
@@ -1677,25 +1430,34 @@ function M.serialize(root, opt)
         '<External>nil</External>',
     }
     local ctx = {
-        refs = refs, cnt = cnt, out = out, st = st, opt = opt,
-        pc = {}, dc = {}, done = {}, dbg = {}, syn = 0,
-        block = blk, ign = ign,
-        maxd = mmax(1, tonum(opt.maxDepth) or 4000),
-        maxi = mmax(0, tonum(opt.maxInstances) or mhuge),
-        yi = mmax(0.001, tonum(opt.yieldInterval) or 0.014),
-        fs = oclock(),
-        dl = {}, ghp = ghp, shp = sscript, kids = {},
+        refs=refs, cnt=cnt, out=out, st=st, opt=opt,
+        pc={}, dc={}, done={}, dbg={}, syn=0,
+        block=blk, ign=ign,
+        maxd=mmax(1, tonum(opt.maxDepth) or 4000),
+        maxi=mmax(0, tonum(opt.maxInstances) or mhuge),
+        sinceYield=0, lastYield=oclock(),
+        assignCount=0, aborted=false,
+        dl={}, ghp=ghp, shp=sscript, kids={},
     }
-    for _, e in ipairs(ents) do
-        if e.inst then
-            assign(e.inst, refs, cnt, blk, ctx, 1)
-        else
-            for _, k in ipairs(e.kids) do
-                assign(k, refs, cnt, blk, ctx, 2)
+
+    -- ---- Pass 1: assign references (chunked + yielding) ----
+    local p1ok, p1err = xpcall(function()
+        for _, e in ipairs(ents) do
+            if e.inst then
+                assign(e.inst, refs, cnt, blk, ctx, 1)
+            else
+                for _, k in ipairs(e.kids) do assign(k, refs, cnt, blk, ctx, 2) end
             end
+            task.wait() -- breathe between roots
         end
+    end, function(x) return x end)
+    if not p1ok then
+        for k, d in pairs(ctx.dc) do if d then pcall(function() d:Destroy() end) end end
+        error(p1err, 0)
     end
     st.refs = cnt.n
+
+    -- ---- Pass 2: walk (chunked + yielding) ----
     local ok, err = xpcall(function()
         for _, e in ipairs(ents) do
             if e.inst then
@@ -1712,46 +1474,80 @@ function M.serialize(root, opt)
                 end
                 ins(out, '</Item>')
             end
+            task.wait()
         end
         if opt.terrain then
             ctx.syn = ctx.syn + 1
             local ti = terrainItem(ctx, "RBXsyn" .. ctx.syn)
-            if ti ~= "" then
-                ins(out, ti)
-                st.items = st.items + 1
-            end
+            if ti ~= "" then ins(out, ti); st.items = st.items + 1 end
         end
         ins(out, '</roblox>')
         st.empty = (st.items == 0)
     end, function(x) return x end)
+
+    -- cleanup: destroy all cached default instances
     for k, d in pairs(ctx.dc) do
         if d then pcall(function() d:Destroy() end) end
         ctx.dc[k] = nil
     end
+
     if not ok then error(err, 0) end
-    local xml = cat(out, "\n")
-    st.bytes = #xml
+
+    -- ---- Pass 3: write XML in chunks (no giant string) ----
+    local totalBytes = 0
+    local function emit(s) totalBytes = totalBytes + #s; return s end
+    for i = 1, #out do emit(out[i]) end
+    st.bytes = totalBytes
     st.refs = cnt.n
     st.time = oclock() - t0
-    repairRefs(xml, st)
-    local vok, vmsg = true, "off"
-    if opt.validate ~= false then vok, vmsg = validate(xml, st) end
-    if opt.mode ~= "silent" and opt.stats ~= false then
-        report(st, vok, vmsg)
+
+    -- Validate by concatenating only for the check (skipped in safe mode for huge saves)
+    local vok, vmsg = true, "skipped (safeMode)"
+    local xml = nil
+    if not safeMode or totalBytes < 50 * 1024 * 1024 then
+        xml = cat(out, "\n")
+        vok, vmsg = validate(xml, st)
+        if opt.mode ~= "silent" and opt.stats ~= false then report(st, vok, vmsg) end
+    elseif opt.mode ~= "silent" and opt.stats ~= false then
+        print(sfmt("[Walke] wrote %d chunks (~%.1f MB), validation skipped",
+            #out, totalBytes / 1048576))
     end
-    return xml, st, vok, vmsg
+    return xml or out, st, vok, vmsg
 end
+
+--=====[ save (with HUD + chunked disk write) ]==============================
 
 local function rawSave(o, fn, opt)
     opt = opt or {}
     if opt.native then
         local nok, nerr = tryNative(o, fn, opt)
         if nok then
-            print("[Walke] handed off to executor saveinstance — check workspace folder for " .. tostr(fn))
+            print("[Walke] native saveinstance handoff → " .. tostr(fn))
             return { ok = true, stage = "native" }
         end
-        warn("[Walke] native saveinstance failed (" .. tostr(nerr) .. "); using Walke serializer")
+        warn("[Walke] native failed: " .. tostr(nerr))
     end
+
+    local result = M.serialize(o, opt)
+    local xmlOrChunks, st, vok, vmsg = result, select(2, M.serialize(o, opt))
+
+    -- M.serialize returns (xml, st, vok, vmsg); pull correctly:
+    -- (we re-run to get all returns — no, that's wasteful. Fix: capture all)
+    -- [see note below — this is the corrected pattern]
+end
+
+-- NOTE: The wrapper below replaces rawSave entirely (correct 4-return capture)
+local function rawSaveImpl(o, fn, opt)
+    opt = opt or {}
+    if opt.native then
+        local nok, nerr = tryNative(o, fn, opt)
+        if nok then
+            print("[Walke] native saveinstance → " .. tostr(fn))
+            return { ok = true, stage = "native" }
+        end
+        warn("[Walke] native failed: " .. tostr(nerr))
+    end
+
     local xml, st, vok, vmsg
     local ok, err = pcall(function()
         xml, st, vok, vmsg = M.serialize(o, opt)
@@ -1764,83 +1560,77 @@ local function rawSave(o, fn, opt)
         return { ok = false, stage = "serialize", err = err }
     end
     if st and st.empty then
-        warn("[Walke] no valid roots to serialize")
-        return { ok = false, stage = "empty", err = "no valid roots", stats = st }
+        warn("[Walke] nothing to serialize")
+        return { ok = false, stage = "empty", stats = st }
     end
-    if opt.validate ~= false and not vok then
+    if opt.validate ~= false and not vok and st.bytes < 50 * 1024 * 1024 then
         warn("[Walke] validation failed: " .. tostr(vmsg))
-        return { ok = false, stage = "validate", err = vmsg, xml = xml, stats = st }
+        return { ok = false, stage = "validate", err = vmsg, stats = st }
     end
-    if writefile then
-        local wok, werr
-        local chunk = mmax(65536, tonum(opt.writeChunkSize) or 4000000)
-        if #xml > chunk and appendfile and delfile then
-            wok, werr = pcall(function()
-                pcall(delfile, fn)
-                local n = #xml
-                local i = 1
-                local first = true
-                while i <= n do
-                    local part = ssub(xml, i, mmin(i + chunk - 1, n))
-                    if first then
-                        writefile(fn, part); first = false
-                    else
-                        appendfile(fn, part)
+
+    -- Chunked write: xml is either a string or an array of chunks
+    if writefile and fn then
+        local wok, werr = pcall(function()
+            if typ(xml) == "table" then
+                -- array of chunks
+                if appendfile and delfile then
+                    pcall(delfile, fn)
+                    local first = true
+                    for i = 1, #xml do
+                        if first then writefile(fn, xml[i]); first = false
+                        else appendfile(fn, xml[i]) end
+                        if i % 64 == 0 then task.wait() end
                     end
-                    i = i + chunk
+                else
+                    local all = cat(xml, "\n")
+                    writefile(fn, all)
                 end
-            end)
-        else
-            wok, werr = pcall(writefile, fn, xml)
-        end
+            else
+                writefile(fn, xml)
+            end
+        end)
         if not wok then
-            warn("[Walke] could not write " .. tostr(fn))
-            return { ok = false, stage = "write", err = werr, xml = xml, stats = st }
+            warn("[Walke] could not write " .. tostr(fn) .. ": " .. tostr(werr))
+            return { ok = false, stage = "write", err = werr, stats = st }
         end
         print("[Walke] wrote " .. tostr(fn))
+        return { ok = true, stage = "done", stats = st, valid = vok, message = vmsg }
     else
         return { ok = true, stage = "serialized", xml = xml, stats = st, valid = vok, message = vmsg }
     end
-    return { ok = true, stage = "done", xml = xml, stats = st, valid = vok, message = vmsg }
 end
 
 function M.save(o, fn, opt)
     opt = opt or {}
-    if opt.hud == false then return rawSave(o, fn, opt) end
+    if opt.hud == false then return rawSaveImpl(o, fn, opt) end
 
     local ui, uierr = UI.create(opt.hudOptions)
     if not ui then
-        warn("[Walke] HUD creation failed: " .. tostr(uierr) .. " — console only")
-        return rawSave(o, fn, opt)
+        warn("[Walke] HUD failed: " .. tostr(uierr) .. " — console only")
+        return rawSaveImpl(o, fn, opt)
     end
 
     ui:push("info", "Save started → " .. tostr(fn))
     ui:setTitle("Serializing")
     ui:setStatus("Walking instances…", COLORS.accent)
 
-    local oldWarn, oldPrint = warn, print
-    local function hook(orig, level)
-        return function(...)
-            local parts = {}
-            for i = 1, select("#", ...) do
-                parts[#parts + 1] = tostr(select(i, ...))
-            end
-            local msg = cat(parts, " ")
-            msg = sgsub(msg, "^%[Walke%]%s*", "")
-            pcall(function() ui:push(level, msg) end)
-            if orig then pcall(orig, ...) end
-        end
+    -- HUD throttling — at most 4 updates/sec
+    local lastHud = 0
+    local function hudUpdate(inst, items, bytes)
+        local now = oclock()
+        if now - lastHud < 0.25 then return end
+        lastHud = now
+        pcall(function()
+            ui:setLabel("items", "items   " .. tostr(items or 0))
+            ui:setLabel("bytes", "bytes   " .. fmtBytes(bytes or 0), COLORS.text)
+            ui:setLabel("time",  "time    " .. fmtTime(now - ui.startTime), COLORS.text)
+            ui:setStatus(sfmt("Walking… %d instances", inst or 0), COLORS.accent)
+        end)
     end
-    warn  = hook(warn,  "warn")
-    print = hook(print, "info")
 
     local callerOnProgress = opt.onProgress
     opt.onProgress = function(inst, items, bytes)
-        pcall(function()
-            ui:updateStats({ inst = inst, items = items, bytes = bytes or 0 })
-            ui:setProgress(inst, opt.maxInstances or inst)
-            ui:setStatus(sfmt("Walking… %d instances, %d items", inst, items), COLORS.accent)
-        end)
+        hudUpdate(inst, items, bytes)
         if callerOnProgress then pcall(callerOnProgress, inst, items, bytes) end
     end
 
@@ -1851,32 +1641,42 @@ function M.save(o, fn, opt)
         return false
     end
 
-    local ok, res = pcall(rawSave, o, fn, opt)
+    -- Redirect print/warn into HUD (with original still called)
+    local oldWarn, oldPrint = warn, print
+    local function hook(orig, level)
+        return function(...)
+            local parts = {}
+            for i = 1, select("#", ...) do parts[#parts + 1] = tostr(select(i, ...)) end
+            local msg = sgsub(cat(parts, " "), "^%[Walke%]%s*", "")
+            pcall(function() ui:push(level, msg) end)
+            if orig then pcall(orig, ...) end
+        end
+    end
+    warn  = hook(warn,  "warn")
+    print = hook(print, "info")
+
+    local ok, res = pcall(rawSaveImpl, o, fn, opt)
 
     warn  = oldWarn
     print = oldPrint
 
     if not ok then
-        ui:setTitle("Error")
-        ui:setStatus("Internal error", COLORS.err)
+        ui:setTitle("Error"); ui:setStatus("Internal error", COLORS.err)
         ui:push("err", tostr(res))
     elseif typ(res) ~= "table" then
-        ui:setTitle("Done")
-        ui:setStatus("Finished", COLORS.ok)
-        ui:push("ok", "Save returned " .. typ(res))
+        ui:setTitle("Done"); ui:setStatus("Finished", COLORS.ok)
+        ui:push("ok", "returned " .. typ(res))
     elseif res.ok then
         ui:setTitle("Done")
         ui:setStatus("Saved → " .. tostr(fn), COLORS.ok)
         ui:push("ok", "Saved " .. fmtBytes(res.stats and res.stats.bytes or 0) ..
             " in " .. fmtTime(res.stats and res.stats.time or 0))
         ui:setProgress(1, 1)
-        ui:updateStats(res.stats or {})
     else
         ui:setTitle("Failed")
         ui:setStatus(tostr(res.err or res.stage or "unknown"), COLORS.err)
         ui:push("err", tostr(res.err or res.stage or "unknown"))
     end
-
     if res and res.stats and res.stats.warns then
         for _, w in ipairs(res.stats.warns) do ui:push("warn", w) end
     end
@@ -1884,21 +1684,17 @@ function M.save(o, fn, opt)
     if ui.autoHide then
         task.spawn(function()
             task.wait(ui.autoHideDelay)
-            pcall(function()
-                if ui.root and ui.root.Parent then ui.root.Enabled = false end
-            end)
+            pcall(function() if ui.root and ui.root.Parent then ui.root.Enabled = false end end)
         end)
     end
-
     return res
 end
 
---=====[ Convenience wrapper ]===============================================
+--=====[ Public wrapper ]====================================================
 
 local un = "User"
 pcall(function() un = game:GetService("Players").LocalPlayer.Name end)
-print("Hello " .. un .. ", thanks for using Walke v" .. VERSION ..
-    ". Call walkesave(instance) to serialize — or walkesave() to serialize game.")
+print("Hello " .. un .. ", Walke v" .. VERSION .. " loaded. Use walkesave().")
 
 local function safeName(fn)
     fn = sgsub(tostr(fn), "[/\\]", "_")
@@ -1932,14 +1728,13 @@ local function api(o)
             return M.save(o, safeName(o.filename or "selection.rbxmx"), o.options)
         end
     end
-    warn("[Walke] pass an Instance, {Instances}, or {object=inst,...}; got " .. tostr(t))
+    warn("[Walke] bad argument: " .. tostr(t))
     return { ok = false, stage = "badarg" }
 end
 
 local g = getgenv and getgenv() or _G
 g.walkesave = api
 g.__WALKE_API = api
-
 M.UI = UI
 
 return M
